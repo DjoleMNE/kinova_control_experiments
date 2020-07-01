@@ -3,6 +3,7 @@
 
 #include <string>
 #include <memory>
+#include <vector>
 
 #include <BaseClientRpc.h>
 #include <BaseCyclicClientRpc.h>
@@ -12,6 +13,12 @@
 #include <RouterClient.h>
 #include <TransportClientUdp.h>
 #include <TransportClientTcp.h>
+
+#define BASE_ID_CONFIG 1
+#define BASE_ID_CONTROL 0
+#define ACTUATOR_COUNT 7
+#define MAX_FRAME_ID 65535
+#define JOINT_6_ID 6
 
 namespace k_api = Kinova::Api;
 namespace sc = std::chrono;
@@ -26,19 +33,32 @@ private:
     std::shared_ptr<k_api::SessionManager> mSessionManagerTcp;
     std::shared_ptr<k_api::SessionManager> mSessionManagerUdp;
 
+    void incrementFrameId();
+
 public:
+    const std::vector<double> cJointTorqueLimits {39.0, 39.0, 39.0, 39.0, 9.0, 9.0, 9.0};
+
     std::shared_ptr<k_api::Base::BaseClient> mBaseClient;
     std::shared_ptr<k_api::BaseCyclic::BaseCyclicClient> mBaseCyclicClient;
     std::shared_ptr<k_api::ActuatorConfig::ActuatorConfigClient> mActuatorConfigClient;
 
+    k_api::Base::ServoingModeInformation mServoingModeInfo;
+    k_api::ActuatorConfig::ControlModeInformation mCtrlModeInfo;
+    k_api::BaseCyclic::Command mBaseCmd;
+    k_api::BaseCyclic::Feedback mBaseFb;
+
     KinovaBaseConnection(std::string, uint32_t, uint32_t, std::string, std::string);
     ~KinovaBaseConnection();
+
+    void refreshFeedBack();
+    void setTorqueSingleJoint(uint8_t, double);
+    void moveToHomePosition(uint32_t pTimeoutSec = 20);
+    void stopRobotMotion();
+    void setControlModeAllJoints(k_api::ActuatorConfig::ControlMode);
 };
 
-void move_to_home_position(k_api::Base::BaseClient* pBase, uint32_t pTimeoutSec = 20);
+void handleKinovaException(k_api::KDetailedException&);
 
-void handleKinovaException(k_api::KDetailedException& ex);
-
-bool waitMicroSeconds(const sc::time_point<sc::steady_clock> &pStartTime, const sc::microseconds &pDuration);
+bool waitMicroSeconds(const sc::time_point<sc::steady_clock>&, const sc::microseconds&);
 
 #endif  // _KINOVA_UTIL_H

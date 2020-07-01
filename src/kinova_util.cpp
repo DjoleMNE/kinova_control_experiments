@@ -4,8 +4,7 @@
 
 KinovaBaseConnection::KinovaBaseConnection (
     std::string pHost, uint32_t pTcpPort, uint32_t pUdpPort, std::string pUsername, std::string pPassword
-)
-{
+) {
     auto errorCallback = [](k_api::KError err){ cout << "__ callback error __" << err.toString(); };
 
     std::cout << "Creating TCP transport client" << std::endl;
@@ -45,10 +44,39 @@ KinovaBaseConnection::KinovaBaseConnection (
     mBaseClient = std::make_shared<k_api::Base::BaseClient>(mRouterTcp.get());
     mBaseCyclicClient = std::make_shared<k_api::BaseCyclic::BaseCyclicClient>(mRouterUdp.get());
     mActuatorConfigClient = std::make_shared<k_api::ActuatorConfig::ActuatorConfigClient>(mRouterTcp.get());
+
+    // Clearing faults
+    try {
+        mBaseClient->ClearFaults();
+    } catch(...) {
+        std::cerr << "error clearing robot faults" << std::endl;
+        throw;
+    }
+
+    // Initialize each actuator to their current position
+    // Save the current actuator position, to avoid a following error
+    try {
+        mServoingModeInfo.set_servoing_mode(k_api::Base::ServoingMode::LOW_LEVEL_SERVOING);
+        mBaseClient->SetServoingMode(mServoingModeInfo);
+
+        mBaseFb = mBaseCyclicClient->RefreshFeedback();
+
+        for (int i = BASE_ID_CONTROL; i < ACTUATOR_COUNT + BASE_ID_CONTROL; i++)
+            mBaseCmd.add_actuators()->set_position(mBaseFb.actuators(i).position());
+
+        // Send a first frame
+        mBaseFb = mBaseCyclicClient->Refresh(mBaseCmd);
+
+    } catch (...) {
+        std::cerr << "error initializing joint positions" << std::endl;
+        throw;
+    }
 }
 
 KinovaBaseConnection::~KinovaBaseConnection()
 {
+    stopRobotMotion();
+
     // Close API session
     mSessionManagerTcp->CloseSession();
     mSessionManagerUdp->CloseSession();
@@ -58,6 +86,78 @@ KinovaBaseConnection::~KinovaBaseConnection()
     mTransportClientTcp->disconnect();
     mRouterUdp->SetActivationStatus(false);
     mTransportClientUdp->disconnect();
+}
+
+void KinovaBaseConnection::refreshFeedBack() {
+    try {
+        mBaseFb = mBaseCyclicClient->RefreshFeedback();
+    } catch (...) {
+        std::cerr << "refreshFeedBack: error reading arm sensors" << std::endl;
+    }
+}
+
+void KinovaBaseConnection::setTorqueSingleJoint(uint8_t pJointId, double pMaxTorqueFraction) {
+    if (pJointId > ACTUATOR_COUNT - 1)
+        throw runtime_error("setJointTorqueSingle: invalid Joint ID: " + std::to_string(pJointId));
+    if (pMaxTorqueFraction > 1.0)
+        throw runtime_error("setJointTorqueSingle: torque fraction cannot be > 1: " +
+                            std::to_string(pMaxTorqueFraction));
+
+    mBaseCmd.mutable_actuators(pJointId)->set_position(mBaseCmd.actuators(pJointId).position());
+    mBaseCmd.mutable_actuators(pJointId)->set_torque_joint(pMaxTorqueFraction * cJointTorqueLimits[pJointId]);
+
+    incrementFrameId();
+
+    try
+    {
+        mBaseFb = mBaseCyclicClient->Refresh(mBaseCmd, 0);
+    }
+    catch(...)
+    {
+        std::cerr << "setJointTorqueSingle: error sending command" << std::endl;
+        throw;
+    }
+}
+
+void KinovaBaseConnection::setControlModeAllJoints(k_api::ActuatorConfig::ControlMode pMode)
+{
+    mCtrlModeInfo.set_control_mode(pMode);
+    for (int actuatorId = BASE_ID_CONFIG; actuatorId < ACTUATOR_COUNT + BASE_ID_CONFIG; actuatorId++)
+        mActuatorConfigClient->SetControlMode(mCtrlModeInfo, actuatorId);
+}
+
+void KinovaBaseConnection::stopRobotMotion()
+{
+    // read fb
+    try {
+        mBaseFb = mBaseCyclicClient->RefreshFeedback();
+    } catch(...) {
+        std::cerr << "error when reading sensors before stopping the robot" << std::endl;
+        throw;
+    }
+
+    for (int i = BASE_ID_CONTROL; i < ACTUATOR_COUNT + BASE_ID_CONTROL; i++)
+        mBaseCmd.mutable_actuators(i)->set_position(mBaseFb.actuators(i).position());
+
+    setControlModeAllJoints(k_api::ActuatorConfig::ControlMode::POSITION);
+
+    incrementFrameId();
+
+    try {
+        mBaseFb = mBaseCyclicClient->Refresh(mBaseCmd);
+    } catch (...) {
+        std::cerr << "error when sending command to stop the robot" << std::endl;
+        throw;
+    }
+}
+
+void KinovaBaseConnection::incrementFrameId()
+{
+    mBaseCmd.set_frame_id(mBaseCmd.frame_id() + 1);
+    if (mBaseCmd.frame_id() > MAX_FRAME_ID) mBaseCmd.set_frame_id(0);
+
+    for (int i = BASE_ID_CONTROL; i < ACTUATOR_COUNT + BASE_ID_CONTROL; i++)
+        mBaseCmd.mutable_actuators(i)->set_command_id(mBaseCmd.frame_id());
 }
 
 // Create an event listener that will set the promise action event to the exit value
@@ -81,19 +181,18 @@ std::function<void(k_api::Base::ActionNotification)>
     };
 }
 
-void move_to_home_position(k_api::Base::BaseClient* base, uint32_t pTimeoutSec)
+void KinovaBaseConnection::moveToHomePosition(uint32_t pTimeoutSec)
 {
     // Make sure the arm is in Single Level Servoing before executing an Action
-    auto servoingMode = k_api::Base::ServoingModeInformation();
-    servoingMode.set_servoing_mode(k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING);
-    base->SetServoingMode(servoingMode);
+    mServoingModeInfo.set_servoing_mode(k_api::Base::ServoingMode::SINGLE_LEVEL_SERVOING);
+    mBaseClient->SetServoingMode(mServoingModeInfo);
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     // Move arm to ready position
     std::cout << "Moving the arm to a safe position" << std::endl;
     auto action_type = k_api::Base::RequestedActionType();
     action_type.set_action_type(k_api::Base::REACH_JOINT_ANGLES);
-    auto action_list = base->ReadAllActions(action_type);
+    auto action_list = mBaseClient->ReadAllActions(action_type);
     auto action_handle = k_api::Base::ActionHandle();
     action_handle.set_identifier(0);
     for (auto action : action_list.action_list())
@@ -113,17 +212,17 @@ void move_to_home_position(k_api::Base::BaseClient* base, uint32_t pTimeoutSec)
         // Connect to notification action topic
         std::promise<k_api::Base::ActionEvent> finish_promise;
         auto finish_future = finish_promise.get_future();
-        auto promise_notification_handle = base->OnNotificationActionTopic(
+        auto promise_notification_handle = mBaseClient->OnNotificationActionTopic(
             create_event_listener_by_promise(finish_promise),
             k_api::Common::NotificationOptions()
         );
 
         // Execute action
-        base->ExecuteActionFromReference(action_handle);
+        mBaseClient->ExecuteActionFromReference(action_handle);
 
         // Wait for future value from promise
         const auto status = finish_future.wait_for(std::chrono::seconds{pTimeoutSec});
-        base->Unsubscribe(promise_notification_handle);
+        mBaseClient->Unsubscribe(promise_notification_handle);
 
         if(status != std::future_status::ready)
         {
@@ -133,10 +232,10 @@ void move_to_home_position(k_api::Base::BaseClient* base, uint32_t pTimeoutSec)
     }
 }
 
-void handleKinovaException(k_api::KDetailedException& ex) {
-    std::cerr << "Kortex exception: " << ex.what() << std::endl;
+void handleKinovaException(k_api::KDetailedException& pEx) {
+    std::cerr << "Kortex exception: " << pEx.what() << std::endl;
     std::cerr << "Error sub-code: "
-              << k_api::SubErrorCodes_Name(k_api::SubErrorCodes(ex.getErrorInfo().getError().error_sub_code()))
+              << k_api::SubErrorCodes_Name(k_api::SubErrorCodes(pEx.getErrorInfo().getError().error_sub_code()))
               << std::endl;
 }
 
